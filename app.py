@@ -1,9 +1,14 @@
 import sys
+import os
 import asyncio
 
-# 🌟 Windows 補丁：確保幽靈瀏覽器能順利啟動
+# --- 🌟 雲端與本機雙重補丁 ---
+# 1. 如果是 Windows 電腦，切換到正確的引擎
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+# 2. 讓雲端主機自動下載幽靈瀏覽器核心 (Chromium)
+os.system("playwright install chromium")
 
 import streamlit as st
 from playwright.sync_api import sync_playwright
