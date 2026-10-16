@@ -11,7 +11,7 @@ from googleapiclient.discovery import build
 # 1. 系統核心與台灣時區設定
 # ==========================================
 TARGET_CALENDAR_ID = 'cargoada@gmail.com' 
-st.set_page_config(page_title="家教排課系統 v3.3.2", page_icon="📅", layout="centered")
+st.set_page_config(page_title="家教排課系統 v3.4", page_icon="📅", layout="centered")
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/calendar']
 TW_TZ = ZoneInfo("Asia/Taipei")
 
@@ -31,7 +31,7 @@ def parse_dt(series):
     return pd.to_datetime(s, format='mixed', errors='coerce')
 
 def sanitize_edt(s_series, e_series):
-    """🔥 自動修復異常的結束時間：若結束時間早於開始時間、或超過 8 小時(跨日錯亂)，自動校正為 +1.5 小時"""
+    """自動修復異常的結束時間：確保結束時間必定在同一天合理範圍內"""
     edt = e_series.fillna(s_series + timedelta(hours=1.5))
     dur_h = (edt - s_series).dt.total_seconds() / 3600
     bad_mask = (dur_h <= 0) | (dur_h > 8) | edt.isna()
@@ -51,7 +51,7 @@ except: pass
 # ==========================================
 if 'current_user' not in st.session_state: st.session_state.current_user = None
 if st.session_state.current_user is None:
-    st.title("👋 歡迎使用排課系統 v3.3.2")
+    st.title("👋 歡迎使用排課系統 v3.4")
     if "users" in st.secrets:
         selected_login = st.selectbox("請選擇您的身分", list(st.secrets["users"].keys()))
         if st.button("🚀 進入系統", type="primary", use_container_width=True):
@@ -88,7 +88,6 @@ def get_cloud_data(worksheet_name):
             valid_mask = (df['start_time'].astype(str).str.strip().replace('nan', '') != '') & \
                          (df['student_id'].astype(str).str.strip().replace('nan', '') != '')
             df = df[valid_mask].copy()
-            # 清除狀態欄位的隱形空白
             df['status'] = df['status'].astype(str).str.strip()
             
         for num_col in ['id', 'invoice_id', 'actual_rate', 'is_paid', 'total_amount', 'default_rate']:
@@ -200,8 +199,8 @@ def get_conflicts(new_s, new_e, exclude_id=None, exclude_draft_idx=None):
 # 側邊欄與課表診斷器
 # ==========================================
 with st.sidebar:
-    st.header(f"👤 {st.session_state.current_user}")
-    st.caption(f"🕒 系統台灣時間：{now_tw().strftime('%Y-%m-%d %H:%M')}")
+    st.header(f"👤 {st.session_state.current_user} (v3.4)")
+    st.caption(f"🕒 台灣時間：{now_tw().strftime('%Y-%m-%d %H:%M')}")
     if st.button("🔄 同步/刷新雲端", use_container_width=True, key="side_refresh"):
         st.session_state.initialized = False
         st.rerun()
@@ -389,15 +388,16 @@ with tab2:
                                 st.session_state.draft_list = [] 
                                 st.toast("🎉 排課完成！"); time.sleep(0.4); st.rerun()
 
-        # 🔥 批量刪課同步改為純未來課程 (dt > now_tw())
         with st.expander("🧹 批量刪課 (清理未來預約排課)"):
             if not st.session_state.df_sess.empty:
                 df_dl = st.session_state.df_sess.copy()
                 df_dl['dt'] = parse_dt(df_dl['start_time'])
+                df_dl['edt'] = sanitize_edt(df_dl['dt'], parse_dt(df_dl['end_time']))
                 df_dl['st_clean'] = df_dl['status'].astype(str).str.strip()
                 df_dl = df_dl.dropna(subset=['dt'])
                 
-                df_dl = df_dl[(df_dl['dt'] > now_tw()) & (~df_dl['st_clean'].isin(['已完成', '已取消']))].sort_values('dt', ascending=True)
+                current_t = now_tw()
+                df_dl = df_dl[(df_dl['edt'] > current_t) & (~df_dl['st_clean'].isin(['已完成', '已取消']))].sort_values('dt', ascending=True)
                 
                 if not df_dl.empty:
                     ops = {f"{r['dt'].strftime('%Y-%m-%d %H:%M')} | {name_map.get(resolve_sid(r['student_id']), '未知')} (ID:{r['id']})": r['id'] for _, r in df_dl.iterrows()}
@@ -414,8 +414,9 @@ with tab2:
                 else:
                     st.info("🎯 目前沒有未來的預約課程需要清理。")
 
-    # 🔥 徹底修正：以「開始時間 (dt > now_tw())」為準，只要開始上課時間已過，或是狀態為已完成/已取消，一律隱藏！
-    st.divider(); st.subheader("📋 未來課表調課中心")
+    # 🔥 標題改為「未來待上課表調課中心」，並執行雙重鐵腕過濾（時間已過 或 狀態已完成/取消 全部隱藏）
+    st.divider()
+    st.subheader("📋 未來待上課表調課中心 (已上過自動隱藏)")
     if not st.session_state.df_sess.empty:
         df_l = st.session_state.df_sess.copy()
         df_l['dt'] = parse_dt(df_l['start_time'])
@@ -423,7 +424,9 @@ with tab2:
         df_l['st_clean'] = df_l['status'].astype(str).str.strip()
         df_l = df_l.dropna(subset=['dt'])
         
-        df_f = df_l[(df_l['dt'] > now_tw()) & (~df_l['st_clean'].isin(['已完成', '已取消']))].sort_values('dt')
+        current_t = now_tw()
+        # 雙重過濾：1. 結束時間必須大於現在 (edt > current_t) 且 2. 狀態不是已完成/已取消/請假
+        df_f = df_l[(df_l['edt'] > current_t) & (~df_l['st_clean'].isin(['已完成', '已取消']))].sort_values('dt')
         
         if not df_f.empty:
             for _, r in df_f.iterrows():
@@ -478,7 +481,7 @@ with tab3:
             df['dt'] = parse_dt(df['start_time'])
             df['edt'] = sanitize_edt(df['dt'], parse_dt(df['end_time']))
             df['st_clean'] = df['status'].astype(str).str.strip()
-            pm = (~df['st_clean'].isin(['請假','已取消'])) & (df['dt'] < now_tw()) & (pd.to_numeric(df.get('invoice_id',0), errors='coerce').fillna(0) == 0)
+            pm = (~df['st_clean'].isin(['請假','已取消'])) & (df['edt'] < now_tw()) & (pd.to_numeric(df.get('invoice_id',0), errors='coerce').fillna(0) == 0)
             df_p = df[pm].copy()
             if not df_p.empty:
                 df_p['mk'] = df_p['dt'].dt.strftime('%Y-%m')
