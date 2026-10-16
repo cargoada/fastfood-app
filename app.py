@@ -11,7 +11,7 @@ from googleapiclient.discovery import build
 # 1. 系統核心與台灣時區設定
 # ==========================================
 TARGET_CALENDAR_ID = 'cargoada@gmail.com' 
-st.set_page_config(page_title="家教排課系統 v3.3.1", page_icon="📅", layout="centered")
+st.set_page_config(page_title="家教排課系統 v3.3.2", page_icon="📅", layout="centered")
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/calendar']
 TW_TZ = ZoneInfo("Asia/Taipei")
 
@@ -26,9 +26,17 @@ def clean_gid(val):
     return "" if s.lower() in ["", "nan", "none", "0", "0.0"] else s
 
 def parse_dt(series):
-    """🔥 萬用時間解析器：同時相容 ISO 格式、斜線格式與試算表自動轉型，防止新課程被當成 NaT 濾掉"""
+    """萬用時間解析器"""
     s = series.astype(str).str.strip().str.replace('T', ' ', regex=False)
     return pd.to_datetime(s, format='mixed', errors='coerce')
+
+def sanitize_edt(s_series, e_series):
+    """🔥 自動修復異常的結束時間：若結束時間早於開始時間、或超過 8 小時(跨日錯亂)，自動校正為 +1.5 小時"""
+    edt = e_series.fillna(s_series + timedelta(hours=1.5))
+    dur_h = (edt - s_series).dt.total_seconds() / 3600
+    bad_mask = (dur_h <= 0) | (dur_h > 8) | edt.isna()
+    edt = edt.where(~bad_mask, s_series + timedelta(hours=1.5))
+    return edt
 
 service = None
 try:
@@ -43,7 +51,7 @@ except: pass
 # ==========================================
 if 'current_user' not in st.session_state: st.session_state.current_user = None
 if st.session_state.current_user is None:
-    st.title("👋 歡迎使用排課系統 v3.3.1")
+    st.title("👋 歡迎使用排課系統 v3.3.2")
     if "users" in st.secrets:
         selected_login = st.selectbox("請選擇您的身分", list(st.secrets["users"].keys()))
         if st.button("🚀 進入系統", type="primary", use_container_width=True):
@@ -71,24 +79,23 @@ def get_cloud_data(worksheet_name):
         df = conn.read(spreadsheet=CURRENT_SHEET_URL, worksheet=worksheet_name, ttl=0)
         if df is None or df.empty: return pd.DataFrame(columns=req_cols)
         
-        # 自動清除整列空白的幽靈列
         df = df.dropna(how='all').copy()
         for col in req_cols:
             if col not in df.columns: df[col] = ""
         df = df[req_cols].copy()
         
-        # 針對課表：過濾掉沒有 start_time 與 student_id 的殘留空白列
         if worksheet_name == "sessions":
             valid_mask = (df['start_time'].astype(str).str.strip().replace('nan', '') != '') & \
                          (df['student_id'].astype(str).str.strip().replace('nan', '') != '')
             df = df[valid_mask].copy()
+            # 清除狀態欄位的隱形空白
+            df['status'] = df['status'].astype(str).str.strip()
             
         for num_col in ['id', 'invoice_id', 'actual_rate', 'is_paid', 'total_amount', 'default_rate']:
             if num_col in df.columns: df[num_col] = pd.to_numeric(df[num_col], errors='coerce').fillna(0).astype(int)
         if 'cumulative_offset' in df.columns:
             df['cumulative_offset'] = pd.to_numeric(df['cumulative_offset'], errors='coerce').fillna(0.0)
             
-        # 若 ID 有重複或為 0，自動重新編號確保唯一性
         if 'id' in df.columns and not df.empty:
             if (df['id'] == 0).any() or df['id'].duplicated().any():
                 df['id'] = range(1, len(df) + 1)
@@ -103,12 +110,12 @@ def save_to_cloud(ws_name, df):
         for col in req_cols:
             if col not in df_save.columns: df_save[col] = ""
             
-        # 寫入前強制將所有有效時間統一規格化，徹底消滅格式分岐
         if ws_name == "sessions" and not df_save.empty:
             valid_mask = df_save['start_time'].astype(str).str.strip().replace('nan', '') != ''
             df_save = df_save[valid_mask].copy()
+            df_save['status'] = df_save['status'].astype(str).str.strip()
             s_dt = parse_dt(df_save['start_time'])
-            e_dt = parse_dt(df_save['end_time']).fillna(s_dt + timedelta(hours=1.5))
+            e_dt = sanitize_edt(s_dt, parse_dt(df_save['end_time']))
             valid_dt = s_dt.notna()
             df_save.loc[valid_dt, 'start_time'] = s_dt[valid_dt].dt.strftime('%Y-%m-%dT%H:%M:%S')
             df_save.loc[valid_dt, 'end_time'] = e_dt[valid_dt].dt.strftime('%Y-%m-%dT%H:%M:%S')
@@ -173,8 +180,9 @@ def get_conflicts(new_s, new_e, exclude_id=None, exclude_draft_idx=None):
     if not st.session_state.df_sess.empty:
         df = st.session_state.df_sess.copy()
         df['s'] = parse_dt(df['start_time'])
-        df['e'] = parse_dt(df['end_time']).fillna(df['s'] + timedelta(hours=1.5))
-        df = df[~df['status'].isin(['請假', '已取消'])].dropna(subset=['s'])
+        df['e'] = sanitize_edt(df['s'], parse_dt(df['end_time']))
+        df['st_clean'] = df['status'].astype(str).str.strip()
+        df = df[~df['st_clean'].isin(['請假', '已取消'])].dropna(subset=['s'])
         if exclude_id is not None: df = df[df['id'] != exclude_id]
         
         mask = (df['s'] < new_e) & (df['e'] > new_s)
@@ -193,6 +201,7 @@ def get_conflicts(new_s, new_e, exclude_id=None, exclude_draft_idx=None):
 # ==========================================
 with st.sidebar:
     st.header(f"👤 {st.session_state.current_user}")
+    st.caption(f"🕒 系統台灣時間：{now_tw().strftime('%Y-%m-%d %H:%M')}")
     if st.button("🔄 同步/刷新雲端", use_container_width=True, key="side_refresh"):
         st.session_state.initialized = False
         st.rerun()
@@ -214,10 +223,10 @@ with st.sidebar:
                         st.rerun()
             else:
                 st.success("✅ 所有課程時間格式皆正常！")
-                if st.button("🔧 強制重新壓實並對齊雲端表格", use_container_width=True):
+                if st.button("🔧 強制重新壓實並修復異常時數", use_container_width=True):
                     if save_to_cloud("sessions", st.session_state.df_sess):
                         st.session_state.initialized = False
-                        st.toast("✅ 雲端表格已重新壓實對齊！")
+                        st.toast("✅ 雲端表格已重新壓實並校正時數！")
                         time.sleep(0.5)
                         st.rerun()
                         
@@ -238,14 +247,16 @@ with tab1:
         if not st.session_state.df_sess.empty:
             df_c = st.session_state.df_sess.copy()
             df_c['sdt'] = parse_dt(df_c['start_time'])
+            df_c['edt'] = sanitize_edt(df_c['sdt'], parse_dt(df_c['end_time']))
+            df_c['st_clean'] = df_c['status'].astype(str).str.strip()
             df_c = df_c.dropna(subset=['sdt'])
-            df_td = df_c[(df_c['sdt'].dt.date == cal_date) & (df_c['status'] != '已取消')].sort_values('sdt')
+            df_td = df_c[(df_c['sdt'].dt.date == cal_date) & (df_c['st_clean'] != '已取消')].sort_values('sdt')
             st.markdown(f"**🔍 {cal_date.strftime('%m/%d')} 課表明細：**")
             if not df_td.empty:
                 for _, r in df_td.iterrows():
                     sid = resolve_sid(r['student_id'])
                     sname, scolor = name_map.get(sid, f"未知({sid})"), color_map.get(sid, "#3498DB")
-                    c_stt = r.get('status', '已預約')
+                    c_stt = r['st_clean']
                     
                     with st.container(border=True):
                         c1, c2, c3, c4 = st.columns([3.5, 1.8, 1.8, 1.8])
@@ -264,8 +275,7 @@ with tab1:
                         with c4.popover("📅 調課"):
                             with st.form(f"t1_fm_{r['id']}"):
                                 nd, nt = st.date_input("日期", r['sdt'].date()), st.time_input("時間", r['sdt'].time())
-                                old_edt = parse_dt(pd.Series([r.get('end_time')])).iloc[0]
-                                old_h = 1.5 if pd.isna(old_edt) else (old_edt - r['sdt']).total_seconds()/3600
+                                old_h = (r['edt'] - r['sdt']).total_seconds()/3600
                                 if st.form_submit_button("💾 確定"):
                                     ns, ne = datetime.combine(nd, nt), datetime.combine(nd, nt) + timedelta(hours=old_h)
                                     cf = get_conflicts(ns, ne, exclude_id=r['id'])
@@ -285,8 +295,9 @@ with tab1:
     if not st.session_state.df_sess.empty:
         dc = st.session_state.df_sess.copy()
         dc['sdt'] = parse_dt(dc['start_time'])
-        dc['edt'] = parse_dt(dc['end_time']).fillna(dc['sdt'] + timedelta(hours=1.5))
-        dc = dc[~dc['status'].isin(['請假', '已取消'])].dropna(subset=['sdt'])
+        dc['edt'] = sanitize_edt(dc['sdt'], parse_dt(dc['end_time']))
+        dc['st_clean'] = dc['status'].astype(str).str.strip()
+        dc = dc[~dc['st_clean'].isin(['請假', '已取消'])].dropna(subset=['sdt'])
         dc['amt'] = ((dc['edt'] - dc['sdt']).dt.total_seconds() / 3600) * pd.to_numeric(dc['actual_rate'], errors='coerce').fillna(0)
         now = now_tw()
         tm = dc[(dc['sdt'].dt.year == now.year) & (dc['sdt'].dt.month == now.month)]['amt'].sum()
@@ -378,19 +389,19 @@ with tab2:
                                 st.session_state.draft_list = [] 
                                 st.toast("🎉 排課完成！"); time.sleep(0.4); st.rerun()
 
-        with st.expander("🧹 批量刪課 (清理近期與未來排課)"):
+        # 🔥 批量刪課同步改為純未來課程 (dt > now_tw())
+        with st.expander("🧹 批量刪課 (清理未來預約排課)"):
             if not st.session_state.df_sess.empty:
                 df_dl = st.session_state.df_sess.copy()
                 df_dl['dt'] = parse_dt(df_dl['start_time'])
-                df_dl['edt'] = parse_dt(df_dl['end_time']).fillna(df_dl['dt'] + timedelta(hours=1.5))
+                df_dl['st_clean'] = df_dl['status'].astype(str).str.strip()
                 df_dl = df_dl.dropna(subset=['dt'])
                 
-                cutoff_time = now_tw() - timedelta(days=14)
-                df_dl = df_dl[df_dl['edt'] > cutoff_time].sort_values('dt', ascending=False)
+                df_dl = df_dl[(df_dl['dt'] > now_tw()) & (~df_dl['st_clean'].isin(['已完成', '已取消']))].sort_values('dt', ascending=True)
                 
                 if not df_dl.empty:
                     ops = {f"{r['dt'].strftime('%Y-%m-%d %H:%M')} | {name_map.get(resolve_sid(r['student_id']), '未知')} (ID:{r['id']})": r['id'] for _, r in df_dl.iterrows()}
-                    sl = st.multiselect("選取刪除", list(ops.keys()), key="t2_mdel")
+                    sl = st.multiselect("選取要刪除的未來課程", list(ops.keys()), key="t2_mdel")
                     if st.button("🚨 批量刪除", type="primary", key="t2_bmdel") and sl:
                         ids = [ops[k] for k in sl]
                         with st.spinner("清除中..."):
@@ -401,22 +412,23 @@ with tab2:
                             if save_to_cloud("sessions", updated_df_del):
                                 st.session_state.df_sess = updated_df_del; st.rerun()
                 else:
-                    st.info("🎯 目前沒有近期或未來的預約課程需要清理。")
+                    st.info("🎯 目前沒有未來的預約課程需要清理。")
 
-    # 🔥 修改重點：只顯示「尚未結束 (edt >= now_tw())」且「尚未完課/取消」的純未來課程
+    # 🔥 徹底修正：以「開始時間 (dt > now_tw())」為準，只要開始上課時間已過，或是狀態為已完成/已取消，一律隱藏！
     st.divider(); st.subheader("📋 未來課表調課中心")
     if not st.session_state.df_sess.empty:
         df_l = st.session_state.df_sess.copy()
         df_l['dt'] = parse_dt(df_l['start_time'])
-        df_l['edt'] = parse_dt(df_l['end_time']).fillna(df_l['dt'] + timedelta(hours=1.5))
+        df_l['edt'] = sanitize_edt(df_l['dt'], parse_dt(df_l['end_time']))
+        df_l['st_clean'] = df_l['status'].astype(str).str.strip()
         df_l = df_l.dropna(subset=['dt'])
         
-        df_f = df_l[(df_l['edt'] >= now_tw()) & (~df_l['status'].isin(['已完成', '已取消']))].sort_values('dt')
+        df_f = df_l[(df_l['dt'] > now_tw()) & (~df_l['st_clean'].isin(['已完成', '已取消']))].sort_values('dt')
         
         if not df_f.empty:
             for _, r in df_f.iterrows():
                 sn = name_map.get(resolve_sid(r['student_id']), '未知')
-                ico = "⚠️(請假)" if r.get('status')=="請假" else ""
+                ico = "⚠️(請假)" if r['st_clean']=="請假" else ""
                 with st.expander(f"{r['dt'].strftime('%m/%d %H:%M')} │ 🧑‍🎓 {sn} {ico}"):
                     with st.form(f"t2_ef_{r['id']}"):
                         c_e1, c_e2 = st.columns(2)
@@ -424,7 +436,7 @@ with tab2:
                         calc_dur = (r['edt']-r['dt']).total_seconds()/3600
                         safe_dur = float(calc_dur) if 0.5 <= calc_dur <= 4.0 else 1.5
                         n_dur = st.slider("時數", 0.5, 4.0, safe_dur, 0.5, key=f"t2_dur_{r['id']}")
-                        stt = st.selectbox("狀態", ["已預約","請假","已取消","已完成"], index=["已預約","請假","已取消","已完成"].index(r.get('status','已預約') if r.get('status') in ["已預約","請假","已取消","已完成"] else "已預約"), key=f"t2_stt_{r['id']}")
+                        stt = st.selectbox("狀態", ["已預約","請假","已取消","已完成"], index=["已預約","請假","已取消","已完成"].index(r['st_clean'] if r['st_clean'] in ["已預約","請假","已取消","已完成"] else "已預約"), key=f"t2_stt_{r['id']}")
                         n_prog = st.text_input("進度 / 備註", value=str(r.get('progress', '')), key=f"t2_prg_{r['id']}")
                         cb1, cb2 = st.columns([3, 1])
                         
@@ -464,8 +476,9 @@ with tab3:
         if not st.session_state.df_sess.empty:
             df = st.session_state.df_sess.copy()
             df['dt'] = parse_dt(df['start_time'])
-            df['edt'] = parse_dt(df['end_time']).fillna(df['dt'] + timedelta(hours=1.5))
-            pm = (~df['status'].isin(['請假','已取消'])) & (df['edt'] < now_tw()) & (pd.to_numeric(df.get('invoice_id',0), errors='coerce').fillna(0) == 0)
+            df['edt'] = sanitize_edt(df['dt'], parse_dt(df['end_time']))
+            df['st_clean'] = df['status'].astype(str).str.strip()
+            pm = (~df['st_clean'].isin(['請假','已取消'])) & (df['dt'] < now_tw()) & (pd.to_numeric(df.get('invoice_id',0), errors='coerce').fillna(0) == 0)
             df_p = df[pm].copy()
             if not df_p.empty:
                 df_p['mk'] = df_p['dt'].dt.strftime('%Y-%m')
@@ -497,7 +510,7 @@ with tab3:
                         mls = st.session_state.df_sess[pd.to_numeric(st.session_state.df_sess.get('invoice_id',0), errors='coerce').fillna(0) == int(r['id'])].copy()
                         if not mls.empty:
                             mls['dt'] = parse_dt(mls['start_time'])
-                            mls['edt'] = parse_dt(mls['end_time']).fillna(mls['dt'] + timedelta(hours=1.5))
+                            mls['edt'] = sanitize_edt(mls['dt'], parse_dt(mls['end_time']))
                             msg = [f"【{sn} {r.get('note','')} 課程費用明細】\n家長您好，以下是本期課程費用明細：\n"]
                             for _, ls in mls.dropna(subset=['dt']).sort_values('dt').iterrows():
                                 h = (ls['edt'] - ls['dt']).total_seconds()/3600
@@ -546,7 +559,9 @@ with tab4:
                 with st.expander("🪄 智慧續排 (自動送入預排購物車)"):
                     if not df_ms.empty:
                         df_ms['dt'] = parse_dt(df_ms['start_time'])
-                        df_valid = df_ms[~df_ms['status'].isin(['請假', '已取消'])].dropna(subset=['dt'])
+                        df_ms['edt'] = sanitize_edt(df_ms['dt'], parse_dt(df_ms['end_time']))
+                        df_ms['st_clean'] = df_ms['status'].astype(str).str.strip()
+                        df_valid = df_ms[~df_ms['st_clean'].isin(['請假', '已取消'])].dropna(subset=['dt'])
                         if not df_valid.empty:
                             wp = df_valid[df_valid['dt'] >= df_valid['dt'].max() - timedelta(days=6)].sort_values('dt')
                             for _, w in wp.iterrows(): st.write(f"📅 星期{weekdays_tw[w['dt'].weekday()]} {w['dt'].strftime('%H:%M')}")
@@ -557,8 +572,7 @@ with tab4:
                                 for i in range(1, int(wk)+1):
                                     for _, p in wp.iterrows():
                                         p_sdt = p['dt']
-                                        p_edt = parse_dt(pd.Series([p.get('end_time')])).iloc[0]
-                                        dur_h = 1.5 if pd.isna(p_edt) else (p_edt - p_sdt).total_seconds()/3600
+                                        dur_h = (p['edt'] - p_sdt).total_seconds()/3600
                                         ns = p_sdt + timedelta(weeks=i)
                                         ne = ns + timedelta(hours=dur_h)
                                         st.session_state.draft_list.append({'sid': sid, 'sname': sn, 'sdt': ns, 'edt': ne, 'sy': sy, 'prog': '', 'rate': int(r.get('default_rate', 500))})
@@ -570,16 +584,18 @@ with tab4:
                 with st.expander("📝 歷史上課進度查看"):
                     if not df_ms.empty:
                         df_ms['dt_p'] = parse_dt(df_ms['start_time'])
-                        p_ls = df_ms[(df_ms['dt_p'] < now_tw()) & (df_ms['status'] != '已取消')].sort_values('dt_p', ascending=False)
+                        df_ms['st_clean'] = df_ms['status'].astype(str).str.strip()
+                        p_ls = df_ms[(df_ms['dt_p'] < now_tw()) & (df_ms['st_clean'] != '已取消')].sort_values('dt_p', ascending=False)
                         if not p_ls.empty:
                             for _, p_c in p_ls.iterrows():
-                                st.markdown(f"**📅 {p_c['dt_p'].strftime('%Y-%m-%d %H:%M')}** {'(請假)' if p_c.get('status') == '請假' else ''}")
+                                st.markdown(f"**📅 {p_c['dt_p'].strftime('%Y-%m-%d %H:%M')}** {'(請假)' if p_c['st_clean'] == '請假' else ''}")
                                 st.write(p_c['progress'] if p_c['progress'] else "（無紀錄）"); st.divider()
 
                 with st.expander("💬 產生 Line 課表通知文案"):
                     if not df_ms.empty:
                         df_ms['dt_f'] = parse_dt(df_ms['start_time'])
-                        f_ls = df_ms[(df_ms['dt_f'] >= now_tw()) & (df_ms['status'] == '已預約')].sort_values('dt_f')
+                        df_ms['st_clean'] = df_ms['status'].astype(str).str.strip()
+                        f_ls = df_ms[(df_ms['dt_f'] >= now_tw()) & (df_ms['st_clean'] == '已預約')].sort_values('dt_f')
                         if not f_ls.empty:
                             msg = [f"【{sn} 近期課程預告】\n家長您好，以下是接下來的排課時間：\n"]
                             for _, f_c in f_ls.iterrows(): msg.append(f"📌 {f_c['dt_f'].strftime('%m/%d')} ({weekdays_tw[f_c['dt_f'].weekday()]}) {f_c['dt_f'].strftime('%H:%M')}")
